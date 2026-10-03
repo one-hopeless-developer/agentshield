@@ -148,6 +148,10 @@ function maskQuotedText(text: string): string {
           const stop = Math.min(findSubstitutionEnd(text, j), end);
           inner += maskQuotedText(text.slice(j, stop));
           j = stop - 1;
+        } else if (ch === '"' && text[j] === "\\" && j + 1 < end) {
+          // An escaped character inside double quotes is literal (e.g. \` or \$), never executed.
+          inner += text[j + 1] === "\n" ? " \n" : "  ";
+          j += 1;
         } else if (ch === '"' && text[j] === "`") {
           let stop = j + 1;
           while (stop < end && text[stop] !== "`") stop += text[stop] === "\\" ? 2 : 1;

