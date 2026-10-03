@@ -40,11 +40,140 @@ const INJECTION_PATTERNS: ReadonlyArray<{
 ];
 
 /**
- * Lookbehind matching a shell command-word position: start of a line, or after
- * `|`, `;`, `&&`, `||`, `$(`, a backtick, `xargs` or `sudo`. Keeps a keyword inside
- * flag clusters (`jq -nc`), paths (`hooks/sudo-guard.sh`) and quoted text from matching.
+ * Command-word matching. A keyword such as `nc` or `sudo` only counts when the shell
+ * would execute it as a command: at the start of a command, after a separator
+ * (`|`, `;`, `&`, `&&`, `||`, `(`, `{`, `$(`, a backtick, a newline), after a shell
+ * keyword (`then`, `do`, `else`, `elif`, `if`, `!`), after a wrapper (`env VAR=x`, `exec`,
+ * `nohup`, `command`, `time`, `nice`, `stdbuf`, `timeout <n>`, `xargs`, `sudo`), with an
+ * optional path prefix (`/usr/bin/nc`, `./nc`). A keyword inside flag clusters
+ * (`jq -nc`), script names (`hooks/sudo-guard.sh`) or quoted text does not count.
+ * Quoted text IS scanned when the shell executes it: the argument of `bash|sh|zsh -c`,
+ * `eval` and `ssh <host>`.
  */
-const COMMAND_WORD_PREFIX = String.raw`(?<=(?:^|[|;\`]|&&|\$\()[ \t]*|\b(?:xargs|sudo)[ \t]+)`;
+const COMMAND_START_KEYWORDS: ReadonlySet<string> = new Set([
+  "then", "do", "else", "elif", "if", "while", "until", "!",
+  "exec", "nohup", "command", "time", "xargs", "sudo", "env", "nice", "stdbuf", "timeout",
+]);
+const COMMAND_ARG_WRAPPERS: ReadonlySet<string> = new Set(["env", "nice", "stdbuf", "timeout"]);
+const WRAPPER_ARG = /^(?:\w+=\S*|-\S*|\d+[smhd]?)$/;
+const EXECUTED_QUOTE_PREFIX =
+  /(?:^|[\s/])(?:(?:bash|sh|zsh)(?:[ \t]+-\S+)*[ \t]+-[A-Za-z]*c|eval|ssh(?:[ \t]+-\S+)*[ \t]+[^\s;|&]+)[ \t]+$/;
+const COMMAND_WORD_SOURCES = new Set<string>();
+
+function commandWordPattern(words: string): RegExp {
+  const pattern = new RegExp(`(?<![\\w])(?:${words})(?=\\s|$)`, "gm");
+  COMMAND_WORD_SOURCES.add(pattern.source);
+  return pattern;
+}
+
+/** Index of the closing quote for the quote opened at `open`, or text.length if unterminated. */
+function findQuoteEnd(text: string, open: number): number {
+  const quote = text[open];
+  for (let i = open + 1; i < text.length; i++) {
+    if (quote === '"' && text[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (text[i] === quote) return i;
+  }
+  return text.length;
+}
+
+/** Index just past the `$(...)` that opens at `open` (text[open] === "$"), or text.length. */
+function findSubstitutionEnd(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open + 1; i < text.length; i++) {
+    if (text[i] === "(") depth++;
+    else if (text[i] === ")" && --depth === 0) return i + 1;
+  }
+  return text.length;
+}
+
+/**
+ * Same-length copy of `text` where quoted spans are blanked out, except spans the
+ * shell executes (see EXECUTED_QUOTE_PREFIX), which are scanned recursively, and
+ * `$(...)` substitutions inside double quotes. Offsets are preserved.
+ */
+function maskQuotedText(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\\" && i + 1 < text.length) {
+      out += text.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (ch !== '"' && ch !== "'") {
+      out += ch;
+      i++;
+      continue;
+    }
+    const end = findQuoteEnd(text, i);
+    const closed = end < text.length;
+    const segment = out.slice(out.lastIndexOf("\n") + 1).split(/[|;&(`]/).pop() ?? "";
+    let replacement: string;
+    if (EXECUTED_QUOTE_PREFIX.test(segment)) {
+      replacement = ";" + maskQuotedText(text.slice(i + 1, end)) + (closed ? " " : "");
+    } else {
+      let inner = "";
+      for (let j = i + 1; j < end; j++) {
+        if (ch === '"' && text[j] === "$" && text[j + 1] === "(") {
+          const stop = Math.min(findSubstitutionEnd(text, j), end);
+          inner += maskQuotedText(text.slice(j, stop));
+          j = stop - 1;
+        } else {
+          inner += text[j] === "\n" ? "\n" : " ";
+        }
+      }
+      replacement = " " + inner + (closed ? " " : "");
+    }
+    out += replacement;
+    i = closed ? end + 1 : text.length;
+  }
+  return out.slice(0, text.length);
+}
+
+/** True when `index` in (quote-masked) `masked` is where the shell expects a command word. */
+function isCommandWordPosition(masked: string, index: number): boolean {
+  // Optional path prefix on the command itself: /usr/bin/nc, ./nc, ../bin/nc
+  const prefix = masked.slice(0, index).replace(/[\w.~\-/]*\/$/, "");
+  const trimmed = prefix.replace(/[ \t]+$/, "");
+  const spaced = trimmed.length !== prefix.length;
+  if (trimmed === "" || trimmed.endsWith("\n")) return true;
+  const last = trimmed[trimmed.length - 1];
+  if (last === "|" || last === ";" || last === "(" || last === "`") return true;
+  if (last === "&") return !/[<>]&$/.test(trimmed);
+  if (!spaced) return false;
+  if (last === "{") return true;
+  const wordMatch = trimmed.match(/(\S+)$/);
+  if (!wordMatch) return false;
+  const word = wordMatch[1];
+  const wordIndex = trimmed.length - word.length;
+  if (COMMAND_START_KEYWORDS.has(word)) return isCommandWordPosition(masked, wordIndex);
+  // Wrapper arguments: env VAR=val, nice -n 10, stdbuf -oL, timeout 5
+  if (WRAPPER_ARG.test(word)) {
+    let before = trimmed.slice(0, wordIndex);
+    for (;;) {
+      const t = before.replace(/[ \t]+$/, "");
+      const m = t.match(/(\S+)$/);
+      if (!m) return false;
+      const mIndex = t.length - m[1].length;
+      if (COMMAND_ARG_WRAPPERS.has(m[1])) return isCommandWordPosition(masked, mIndex);
+      if (!WRAPPER_ARG.test(m[1])) return false;
+      before = t.slice(0, mIndex);
+    }
+  }
+  return false;
+}
+
+function filterCommandWordMatches(content: string, matches: Array<RegExpMatchArray>): Array<RegExpMatchArray> {
+  const masked = maskQuotedText(content);
+  return matches.filter((match) => {
+    const index = match.index ?? 0;
+    return masked.startsWith(match[0], index) && isCommandWordPosition(masked, index);
+  });
+}
 
 /**
  * Hooks that send data to external services.
@@ -66,7 +195,7 @@ const EXFILTRATION_PATTERNS: ReadonlyArray<{
   },
   {
     name: "netcat",
-    pattern: new RegExp(`${COMMAND_WORD_PREFIX}(?:nc|netcat)(?=\\s|$)`, "gm"),
+    pattern: commandWordPattern("nc|netcat"),
     description: "Hook uses netcat — potential reverse shell or data exfiltration",
   },
   {
@@ -81,7 +210,8 @@ function findLineNumber(content: string, matchIndex: number): number {
 }
 
 function findAllMatches(content: string, pattern: RegExp): Array<RegExpMatchArray> {
-  return [...content.matchAll(new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g"))];
+  const matches = [...content.matchAll(new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g"))];
+  return COMMAND_WORD_SOURCES.has(pattern.source) ? filterCommandWordMatches(content, matches) : matches;
 }
 
 interface HookSearchTarget {
@@ -1927,7 +2057,7 @@ export const hookRules: ReadonlyArray<Rule> = [
         readonly description: string;
       }> = [
         {
-          pattern: new RegExp(`${COMMAND_WORD_PREFIX}sudo(?=\\s|$)`, "gm"),
+          pattern: commandWordPattern("sudo"),
           description: "Runs commands as root via sudo",
         },
         {
