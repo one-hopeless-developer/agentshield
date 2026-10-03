@@ -56,8 +56,12 @@ const COMMAND_START_KEYWORDS: ReadonlySet<string> = new Set([
 ]);
 const COMMAND_ARG_WRAPPERS: ReadonlySet<string> = new Set(["env", "nice", "stdbuf", "timeout"]);
 const WRAPPER_ARG = /^(?:\w+=\S*|-\S*|\d+[smhd]?)$/;
+// Group 1 is the executing word (bash -c, eval, ssh <host>); it must itself be in command position.
+// ssh options that take a value (-p 22, -i key, -o opt ...) consume their argument before the host.
 const EXECUTED_QUOTE_PREFIX =
-  /(?:^|[\s/])(?:(?:bash|sh|zsh)(?:[ \t]+-\S+)*[ \t]+-[A-Za-z]*c|eval|ssh(?:[ \t]+-\S+)*[ \t]+[^\s;|&]+)[ \t]+$/;
+  /(?:^|[\s/])((?:bash|sh|zsh)(?:[ \t]+-\S+)*[ \t]+-[A-Za-z]*c|eval|ssh(?:[ \t]+(?:-[pilojFJbcDEeILmOQRSWw][ \t]+\S+|-\S+))*[ \t]+[^\s;|&]+)[ \t]+$/;
+const VALUE_TAKING_TIMEOUT_FLAGS: ReadonlySet<string> = new Set(["-s", "-k"]);
+const ASSIGNMENT_WORD = /^[A-Za-z_]\w*=\S*$/;
 const COMMAND_WORD_SOURCES = new Set<string>();
 
 function commandWordPattern(words: string): RegExp {
@@ -89,6 +93,20 @@ function findSubstitutionEnd(text: string, open: number): number {
   return text.length;
 }
 
+/** Same-length copy of a double-quoted body where `\"` becomes ` "`, so inner quotes are recognised. */
+function unescapeDoubleQuotes(body: string): string {
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "\\" && i + 1 < body.length) {
+      out += body[i + 1] === '"' ? ' "' : body.slice(i, i + 2);
+      i++;
+    } else {
+      out += body[i];
+    }
+  }
+  return out;
+}
+
 /**
  * Same-length copy of `text` where quoted spans are blanked out, except spans the
  * shell executes (see EXECUTED_QUOTE_PREFIX), which are scanned recursively, and
@@ -113,13 +131,27 @@ function maskQuotedText(text: string): string {
     const closed = end < text.length;
     const segment = out.slice(out.lastIndexOf("\n") + 1).split(/[|;&(`]/).pop() ?? "";
     let replacement: string;
-    if (EXECUTED_QUOTE_PREFIX.test(segment)) {
-      replacement = ";" + maskQuotedText(text.slice(i + 1, end)) + (closed ? " " : "");
+    const executor = EXECUTED_QUOTE_PREFIX.exec(segment);
+    let executed = false;
+    if (executor) {
+      const wordStart =
+        out.length - segment.length + executor.index + executor[0].replace(/[ \t]+$/, "").length - executor[1].length;
+      executed = isCommandWordPosition(out, wordStart);
+    }
+    if (executed) {
+      const body = text.slice(i + 1, end);
+      replacement = ";" + maskQuotedText(ch === '"' ? unescapeDoubleQuotes(body) : body) + (closed ? " " : "");
     } else {
       let inner = "";
       for (let j = i + 1; j < end; j++) {
         if (ch === '"' && text[j] === "$" && text[j + 1] === "(") {
           const stop = Math.min(findSubstitutionEnd(text, j), end);
+          inner += maskQuotedText(text.slice(j, stop));
+          j = stop - 1;
+        } else if (ch === '"' && text[j] === "`") {
+          let stop = j + 1;
+          while (stop < end && text[stop] !== "`") stop += text[stop] === "\\" ? 2 : 1;
+          stop = Math.min(stop + 1, end);
           inner += maskQuotedText(text.slice(j, stop));
           j = stop - 1;
         } else {
@@ -151,17 +183,30 @@ function isCommandWordPosition(masked: string, index: number): boolean {
   const word = wordMatch[1];
   const wordIndex = trimmed.length - word.length;
   if (COMMAND_START_KEYWORDS.has(word)) return isCommandWordPosition(masked, wordIndex);
-  // Wrapper arguments: env VAR=val, nice -n 10, stdbuf -oL, timeout 5
-  if (WRAPPER_ARG.test(word)) {
-    let before = trimmed.slice(0, wordIndex);
-    for (;;) {
-      const t = before.replace(/[ \t]+$/, "");
+  // Leading shell assignments keep command position: TOKEN=x nc host
+  if (ASSIGNMENT_WORD.test(word) && isCommandWordPosition(masked, wordIndex)) return true;
+  // Wrapper arguments: env VAR=val, nice -n 10, stdbuf -oL, timeout -s KILL 5
+  if (WRAPPER_ARG.test(word) || trimmed.slice(0, wordIndex).match(/(?:^|\s)-[sk][ \t]+$/)) {
+    const tokenBefore = (s: string): { w: string; i: number } | null => {
+      const t = s.replace(/[ \t]+$/, "");
       const m = t.match(/(\S+)$/);
-      if (!m) return false;
-      const mIndex = t.length - m[1].length;
-      if (COMMAND_ARG_WRAPPERS.has(m[1])) return isCommandWordPosition(masked, mIndex);
-      if (!WRAPPER_ARG.test(m[1])) return false;
-      before = t.slice(0, mIndex);
+      return m ? { w: m[1], i: t.length - m[1].length } : null;
+    };
+    let cur = { w: word, i: wordIndex };
+    let valued = false;
+    for (;;) {
+      const prev = tokenBefore(trimmed.slice(0, cur.i));
+      if (!prev) return false;
+      if (!WRAPPER_ARG.test(cur.w)) {
+        if (!VALUE_TAKING_TIMEOUT_FLAGS.has(prev.w)) return false;
+        valued = true;
+        cur = prev;
+        continue;
+      }
+      if (COMMAND_ARG_WRAPPERS.has(prev.w)) {
+        return (!valued || prev.w === "timeout") && isCommandWordPosition(masked, prev.i);
+      }
+      cur = prev;
     }
   }
   return false;
