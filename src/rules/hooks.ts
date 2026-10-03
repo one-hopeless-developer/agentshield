@@ -40,6 +40,13 @@ const INJECTION_PATTERNS: ReadonlyArray<{
 ];
 
 /**
+ * Lookbehind matching a shell command-word position: start of a line, or after
+ * `|`, `;`, `&&`, `||`, `$(`, a backtick, `xargs` or `sudo`. Keeps a keyword inside
+ * flag clusters (`jq -nc`), paths (`hooks/sudo-guard.sh`) and quoted text from matching.
+ */
+const COMMAND_WORD_PREFIX = String.raw`(?<=(?:^|[|;\`]|&&|\$\()[ \t]*|\b(?:xargs|sudo)[ \t]+)`;
+
+/**
  * Hooks that send data to external services.
  */
 const EXFILTRATION_PATTERNS: ReadonlyArray<{
@@ -59,7 +66,7 @@ const EXFILTRATION_PATTERNS: ReadonlyArray<{
   },
   {
     name: "netcat",
-    pattern: /\bnc\b|\bnetcat\b/g,
+    pattern: new RegExp(`${COMMAND_WORD_PREFIX}(?:nc|netcat)(?=\\s|$)`, "gm"),
     description: "Hook uses netcat — potential reverse shell or data exfiltration",
   },
   {
@@ -1920,7 +1927,7 @@ export const hookRules: ReadonlyArray<Rule> = [
         readonly description: string;
       }> = [
         {
-          pattern: /\bsudo\b/g,
+          pattern: new RegExp(`${COMMAND_WORD_PREFIX}sudo(?=\\s|$)`, "gm"),
           description: "Runs commands as root via sudo",
         },
         {
